@@ -10,14 +10,20 @@
 #include "pycore_interp.h"        // PyInterpreterState.gc
 #include "pycore_interpframe.h"   // _PyFrame_GetLocalsArray()
 #include "pycore_list.h"          // _PyList_GetItemRef()
+#include "pycore_lock.h"          // _PyRawMutex
 #include "pycore_object_alloc.h"  // _PyObject_MallocWithType()
 #include "pycore_pyatomic_ft_wrappers.h"  // FT_ATOMIC_LOAD_INT_RELAXED()
 #include "pycore_pystate.h"       // _PyThreadState_GET()
+#include "pycore_pythread.h"      // PyThread_start_joinable_thread()
 #include "pycore_tstate.h"        // _PyThreadStateImpl
 #include "pycore_tuple.h"         // _PyTuple_MaybeUntrack()
 #include "pycore_weakref.h"       // _PyWeakref_ClearRef()
 
+#include "condvar.h"
 #include "pydtrace.h"
+
+#include <errno.h>
+#include <limits.h>
 
 
 // enable the "mark alive" pass of GC
@@ -31,6 +37,18 @@
 
 // include Python stacks as set of known roots
 #define GC_MARK_ALIVE_STACKS 1
+
+// Parallel mark-alive workers are only used for collections of this
+// generation or older.  Automatic generation 0 collections are usually
+// small enough that thread startup overhead dominates.
+#define GC_PARALLEL_MARK_MIN_GENERATION 1
+
+// A conservative upper bound.  For the heap sizes seen in pyperformance, a
+// small number of workers avoids queue and cache-coherency overhead while
+// still exploiting modern multi-core processors.  Can be overridden for
+// experimentation using PYTHON_GC_MARK_WORKERS.
+#define GC_MAX_PARALLEL_MARK_WORKERS 16
+#define GC_DEFAULT_PARALLEL_MARK_WORKERS 8
 
 
 #ifdef Py_GIL_DISABLED
@@ -686,19 +704,22 @@ gc_mark_span_push(gc_span_stack_t *ss, PyObject **start, PyObject **end)
     return 0;
 }
 
-static int
-gc_mark_enqueue_no_buffer(PyObject *op, gc_mark_args_t *args)
+static inline int
+gc_mark_enqueue_no_buffer_inline(PyObject *op, gc_mark_args_t *args)
 {
     if (op == NULL) {
         return 0;
     }
-    if (!gc_has_bit(op,  _PyGC_BITS_TRACKED)) {
-        return 0;
-    }
-    if (gc_is_alive(op)) {
+    uint8_t bits = op->ob_gc_bits;
+    if ((bits & (_PyGC_BITS_TRACKED | _PyGC_BITS_ALIVE)) !=
+        _PyGC_BITS_TRACKED) {
         return 0; // already visited this object
     }
-    if (gc_maybe_untrack(op)) {
+    if (!(bits & _PyGC_BITS_DEFERRED) && Py_TYPE(op) != &PyTuple_Type) {
+        // Most traversed objects do not use deferred refcounting and are not
+        // tuples, so they never need the untrack check below.
+    }
+    else if (gc_maybe_untrack(op)) {
         return 0; // was untracked, don't visit it
     }
 
@@ -712,9 +733,15 @@ gc_mark_enqueue_no_buffer(PyObject *op, gc_mark_args_t *args)
 }
 
 static inline int
+gc_mark_enqueue_no_buffer(PyObject *op, gc_mark_args_t *args)
+{
+    return gc_mark_enqueue_no_buffer_inline(op, args);
+}
+
+static inline int
 gc_mark_enqueue_no_buffer_visitproc(PyObject *op, void *args)
 {
-    return gc_mark_enqueue_no_buffer(op, (gc_mark_args_t *)args);
+    return gc_mark_enqueue_no_buffer_inline(op, (gc_mark_args_t *)args);
 }
 
 static int
@@ -747,6 +774,155 @@ gc_mark_enqueue(PyObject *op, gc_mark_args_t *args)
     else {
         return gc_mark_enqueue_no_buffer(op, args);
     }
+}
+
+// A small bounded work queue used by the parallel mark-alive workers.  It is
+// intentionally independent from _PyObjectStack: that stack allocates chunks
+// lazily and uses a singly-linked chunk chain, while this queue is a simple
+// arena that can be split between a fixed number of worker threads without
+// adding another allocation failure mode to the marking path.
+typedef struct {
+    PyObject **items;
+    Py_ssize_t capacity;
+    Py_ssize_t next;
+    _PyRawMutex mutex;
+    int error;
+    int active;
+    int idle;
+    int done;
+} gc_mark_queue;
+
+typedef struct gc_parallel_mark_pool gc_parallel_mark_pool;
+
+#define GC_PARALLEL_LOCAL_BATCH 256
+
+typedef struct gc_parallel_mark_context {
+    gc_mark_queue *shared;
+    PyObject *local[GC_PARALLEL_LOCAL_BATCH];
+    Py_ssize_t local_count;
+} gc_parallel_mark_context;
+
+typedef struct {
+    gc_parallel_mark_pool *pool;
+    PyThread_handle_t handle;
+    PyThread_ident_t ident;
+    int err;
+    gc_parallel_mark_context ctx;
+} gc_parallel_mark_worker;
+
+struct gc_parallel_mark_pool {
+    PyInterpreterState *interp;
+    PyMUTEX_T mutex;
+    PyCOND_T finish_cond;
+    int initialized;
+    int stopping;
+    int run_id;
+    int helper_count;
+    int finished;
+    int workers_ready;
+    gc_parallel_mark_worker *helpers;
+    gc_mark_queue queue;
+};
+
+static void
+gc_mark_queue_fini(gc_mark_queue *queue)
+{
+    _PyRawMutex_Lock(&queue->mutex);
+    PyMem_RawFree(queue->items);
+    queue->items = NULL;
+    queue->capacity = 0;
+    queue->next = 0;
+    queue->active = 0;
+    queue->idle = 0;
+    queue->done = 0;
+    _PyRawMutex_Unlock(&queue->mutex);
+}
+
+static void
+gc_mark_queue_reset(gc_mark_queue *queue, int active)
+{
+    _PyRawMutex_Lock(&queue->mutex);
+    queue->next = 0;
+    queue->active = active;
+    queue->idle = 0;
+    queue->done = 0;
+    queue->error = 0;
+    _PyRawMutex_Unlock(&queue->mutex);
+}
+
+static PyObject *
+gc_mark_queue_pop(gc_mark_queue *queue)
+{
+    _PyRawMutex_Lock(&queue->mutex);
+    PyObject *op = NULL;
+    int is_idle = 0;
+    for (;;) {
+        if (queue->next != 0) {
+            if (is_idle) {
+                queue->idle--;
+            }
+            op = queue->items[--queue->next];
+            _PyRawMutex_Unlock(&queue->mutex);
+            return op;
+        }
+        if (queue->done) {
+            _PyRawMutex_Unlock(&queue->mutex);
+            return NULL;
+        }
+
+        if (!is_idle) {
+            queue->idle++;
+            is_idle = 1;
+            if (queue->idle == queue->active) {
+                queue->done = 1;
+                _PyRawMutex_Unlock(&queue->mutex);
+                return NULL;
+            }
+        }
+        _PyRawMutex_Unlock(&queue->mutex);
+        _Py_yield();
+        _PyRawMutex_Lock(&queue->mutex);
+    }
+}
+
+static int
+gc_mark_queue_push(gc_mark_queue *queue, PyObject *op)
+{
+    _PyRawMutex_Lock(&queue->mutex);
+    if (queue->error) {
+        _PyRawMutex_Unlock(&queue->mutex);
+        return -1;
+    }
+    if (queue->items == NULL) {
+        queue->items = PyMem_RawMalloc(4096 * sizeof(PyObject *));
+        if (queue->items == NULL) {
+            queue->error = 1;
+            _PyRawMutex_Unlock(&queue->mutex);
+            return -1;
+        }
+        queue->capacity = 4096;
+    }
+    else if (queue->next == queue->capacity) {
+        Py_ssize_t new_capacity = queue->capacity * 2;
+        if (new_capacity < queue->capacity) {
+            queue->error = 1;
+            _PyRawMutex_Unlock(&queue->mutex);
+            return -1;
+        }
+        PyObject **new_items = PyMem_RawRealloc(
+            queue->items, new_capacity * sizeof(PyObject *));
+        if (new_items == NULL) {
+            queue->error = 1;
+            _PyRawMutex_Unlock(&queue->mutex);
+            return -1;
+        }
+        queue->items = new_items;
+        queue->capacity = new_capacity;
+    }
+
+    queue->items[queue->next++] = op;
+    _PyRawMutex_Unlock(&queue->mutex);
+    return 0;
 }
 
 // Called when we have a contigous sequence of PyObject pointers, either
@@ -817,6 +993,44 @@ gc_mark_traverse_tuple(PyObject *self, void *args)
     PyTupleObject *tuple = _PyTuple_CAST(self);
     if (gc_mark_enqueue_span(tuple->ob_item, Py_SIZE(tuple), args) < 0) {
         return -1;
+    }
+    return 0;
+}
+
+static int
+gc_mark_traverse_list_no_buffer(PyObject *self, gc_mark_args_t *args)
+{
+    PyListObject *list = (PyListObject *)self;
+    if (list->ob_item == NULL) {
+        return 0;
+    }
+
+    Py_ssize_t size = PyList_GET_SIZE(list);
+    PyObject **items = list->ob_item;
+    for (Py_ssize_t i = 0; i < size; i++) {
+        if (gc_mark_enqueue_no_buffer_inline(items[i], args) < 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int
+gc_mark_traverse_tuple_no_buffer(PyObject *self, gc_mark_args_t *args)
+{
+    _PyTuple_MaybeUntrack(self);
+    if (!_PyObject_GC_IS_TRACKED(self)) {
+        gc_clear_alive(self);
+        return 0;
+    }
+
+    PyTupleObject *tuple = _PyTuple_CAST(self);
+    Py_ssize_t size = Py_SIZE(tuple);
+    PyObject **items = tuple->ob_item;
+    for (Py_ssize_t i = 0; i < size; i++) {
+        if (gc_mark_enqueue_no_buffer_inline(items[i], args) < 0) {
+            return -1;
+        }
     }
     return 0;
 }
@@ -1357,13 +1571,411 @@ gc_propagate_alive(gc_mark_args_t *args)
             assert(_PyObject_GC_IS_TRACKED(op));
             assert(gc_is_alive(op));
             traverseproc traverse = Py_TYPE(op)->tp_traverse;
-            if (traverse(op, gc_mark_enqueue_no_buffer_visitproc, args) < 0) {
+            if (traverse == PyList_Type.tp_traverse) {
+                if (gc_mark_traverse_list_no_buffer(op, args) < 0) {
+                    return -1;
+                }
+            }
+            else if (traverse == PyTuple_Type.tp_traverse) {
+                if (gc_mark_traverse_tuple_no_buffer(op, args) < 0) {
+                    return -1;
+                }
+            }
+            else if (traverse(op, gc_mark_enqueue_no_buffer_visitproc, args) < 0) {
                 return -1;
             }
         }
         return 0;
     }
 }
+
+static int
+gc_parallel_mark_try_claim(PyObject *op)
+{
+    if (!gc_has_bit(op, _PyGC_BITS_TRACKED)) {
+        return 1;
+    }
+
+    uint8_t expected = _Py_atomic_load_uint8_relaxed(&op->ob_gc_bits);
+    while ((expected & _PyGC_BITS_ALIVE) == 0) {
+        uint8_t desired = expected | _PyGC_BITS_ALIVE;
+        if (_Py_atomic_compare_exchange_uint8(&op->ob_gc_bits,
+                                               &expected, desired)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int
+gc_parallel_mark_flush_local(gc_parallel_mark_context *ctx)
+{
+    while (ctx->local_count > 0) {
+        ctx->local_count--;
+        PyObject *item = ctx->local[ctx->local_count];
+        if (gc_mark_queue_push(ctx->shared, item) < 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static PyObject *
+gc_parallel_mark_next(gc_parallel_mark_context *ctx)
+{
+    if (ctx->local_count > 0) {
+        return ctx->local[--ctx->local_count];
+    }
+    return gc_mark_queue_pop(ctx->shared);
+}
+
+static int
+gc_parallel_mark_visit(PyObject *op, void *arg)
+{
+    if (op == NULL) {
+        return 0;
+    }
+
+    gc_parallel_mark_context *ctx = (gc_parallel_mark_context *)arg;
+    if (gc_parallel_mark_try_claim(op) == 0) {
+        if (ctx->local_count >= GC_PARALLEL_LOCAL_BATCH) {
+            return -1;
+        }
+        ctx->local[ctx->local_count++] = op;
+        if (ctx->local_count == GC_PARALLEL_LOCAL_BATCH) {
+            return gc_parallel_mark_flush_local(ctx);
+        }
+    }
+    return 0;
+}
+
+static int
+gc_parallel_mark_one(PyObject *op, gc_parallel_mark_context *ctx)
+{
+    traverseproc traverse = Py_TYPE(op)->tp_traverse;
+    if (traverse == PyTuple_Type.tp_traverse) {
+        _PyTuple_MaybeUntrack(op);
+        if (!_PyObject_GC_IS_TRACKED(op)) {
+            gc_clear_alive(op);
+            return 0;
+        }
+    }
+    return traverse(op, gc_parallel_mark_visit, ctx);
+}
+
+static int
+gc_parallel_mark_drain(gc_parallel_mark_context *ctx)
+{
+    for (;;) {
+        PyObject *op = gc_parallel_mark_next(ctx);
+        if (op == NULL) {
+            _PyRawMutex_Lock(&ctx->shared->mutex);
+            int err = ctx->shared->error;
+            _PyRawMutex_Unlock(&ctx->shared->mutex);
+            return err ? -1 : 0;
+        }
+        if (gc_parallel_mark_one(op, ctx) < 0) {
+            ctx->local_count = 0;
+            _PyRawMutex_Lock(&ctx->shared->mutex);
+            ctx->shared->error = 1;
+            ctx->shared->done = 1;
+            _PyRawMutex_Unlock(&ctx->shared->mutex);
+            return -1;
+        }
+    }
+}
+
+static int
+gc_parallel_mark_enqueue_root(PyObject *op, gc_mark_queue *queue)
+{
+    if (op == NULL) {
+        return 0;
+    }
+    if (gc_parallel_mark_try_claim(op) == 0) {
+        return gc_mark_queue_push(queue, op);
+    }
+    return 0;
+}
+
+#ifdef GC_MARK_ALIVE_STACKS
+static int
+gc_parallel_mark_stackref(_PyStackRef stackref, gc_mark_queue *queue)
+{
+    if (PyStackRef_IsNullOrInt(stackref)) {
+        return 0;
+    }
+    PyObject *op = PyStackRef_AsPyObjectBorrow(stackref);
+    return gc_parallel_mark_enqueue_root(op, queue);
+}
+
+static int
+gc_parallel_mark_thread_stacks(PyInterpreterState *interp,
+                               gc_mark_queue *queue)
+{
+    int err = 0;
+    _Py_FOR_EACH_TSTATE_BEGIN(interp, p) {
+        for (_PyInterpreterFrame *f = p->current_frame;
+             f != NULL; f = f->previous)
+        {
+            if (f->owner >= FRAME_OWNED_BY_INTERPRETER ||
+                f->stackpointer == NULL)
+            {
+                continue;
+            }
+
+            _PyStackRef *top = f->stackpointer;
+            if (gc_parallel_mark_stackref(f->f_funcobj, queue) < 0 ||
+                gc_parallel_mark_stackref(f->f_executable, queue) < 0)
+            {
+                err = -1;
+                goto exit;
+            }
+            while (top != f->localsplus) {
+                --top;
+                if (gc_parallel_mark_stackref(*top, queue) < 0) {
+                    err = -1;
+                    goto exit;
+                }
+            }
+        }
+    }
+exit:
+    _Py_FOR_EACH_TSTATE_END(interp);
+    return err;
+}
+#endif
+
+static int
+gc_parallel_mark_desired_helpers(PyInterpreterState *interp, int generation)
+{
+    if (generation < GC_PARALLEL_MARK_MIN_GENERATION) {
+        return 0;
+    }
+
+    const char *env = Py_GETENV("PYTHON_GC_MARK_WORKERS");
+    int workers = 0;
+    if (env != NULL && *env != '\0') {
+        long value = strtol(env, NULL, 10);
+        if (value > 0 && value < INT_MAX) {
+            workers = (int)value;
+        }
+    }
+    if (workers > 0) {
+        if (workers > GC_MAX_PARALLEL_MARK_WORKERS) {
+            workers = GC_MAX_PARALLEL_MARK_WORKERS;
+        }
+        return workers - 1;
+    }
+
+    return 0;
+}
+
+static void
+gc_parallel_mark_worker_main(void *arg)
+{
+    gc_parallel_mark_worker *worker = (gc_parallel_mark_worker *)arg;
+    gc_parallel_mark_pool *pool = worker->pool;
+
+    _Py_atomic_add_int(&pool->workers_ready, 1);
+    int run_id = _Py_atomic_load_int_acquire(&pool->run_id);
+    for (;;) {
+        int current = _Py_atomic_load_int_acquire(&pool->run_id);
+        while (current == run_id &&
+               !_Py_atomic_load_int_relaxed(&pool->stopping)) {
+            _Py_yield();
+            current = _Py_atomic_load_int_relaxed(&pool->run_id);
+        }
+        if (_Py_atomic_load_int_relaxed(&pool->stopping)) {
+            break;
+        }
+        run_id = current;
+
+        worker->ctx.shared = &pool->queue;
+        worker->ctx.local_count = 0;
+        worker->err = gc_parallel_mark_drain(&worker->ctx);
+
+        _Py_atomic_add_int(&pool->finished, 1);
+        PyMUTEX_LOCK(&pool->mutex);
+        PyCOND_SIGNAL(&pool->finish_cond);
+        PyMUTEX_UNLOCK(&pool->mutex);
+    }
+}
+
+static int
+gc_parallel_mark_pool_init(gc_parallel_mark_pool *pool,
+                           PyInterpreterState *interp, int helper_count)
+{
+    pool->interp = interp;
+    pool->helper_count = helper_count;
+    pool->initialized = 0;
+    pool->stopping = 0;
+    pool->run_id = 0;
+    pool->finished = 0;
+    pool->workers_ready = 0;
+
+    if (PyMUTEX_INIT(&pool->mutex)) {
+        return -1;
+    }
+    if (PyCOND_INIT(&pool->finish_cond)) {
+        PyMUTEX_FINI(&pool->mutex);
+        return -1;
+    }
+
+    pool->helpers = PyMem_RawCalloc(
+        helper_count, sizeof(gc_parallel_mark_worker));
+    if (pool->helpers == NULL) {
+        PyCOND_FINI(&pool->finish_cond);
+        PyMUTEX_FINI(&pool->mutex);
+        return -1;
+    }
+
+    int started = 0;
+    for (int i = 0; i < helper_count; i++) {
+        pool->helpers[i].pool = pool;
+        if (PyThread_start_joinable_thread(
+                gc_parallel_mark_worker_main, &pool->helpers[i],
+                &pool->helpers[i].ident, &pool->helpers[i].handle) < 0)
+        {
+            break;
+        }
+        started++;
+    }
+
+    if (started != helper_count) {
+        _Py_atomic_store_int_relaxed(&pool->stopping, 1);
+        _Py_atomic_store_int_release(&pool->run_id, pool->run_id + 1);
+        for (int i = 0; i < started; i++) {
+            PyThread_join_thread(pool->helpers[i].handle);
+        }
+        PyMem_RawFree(pool->helpers);
+        pool->helpers = NULL;
+        PyCOND_FINI(&pool->finish_cond);
+        PyMUTEX_FINI(&pool->mutex);
+        return -1;
+    }
+
+    while (_Py_atomic_load_int_acquire(&pool->workers_ready) <
+           pool->helper_count) {
+        _Py_yield();
+    }
+
+    pool->initialized = 1;
+    return 0;
+}
+
+static void
+gc_parallel_mark_pool_fini(gc_parallel_mark_pool *pool)
+{
+    if (!pool->initialized) {
+        return;
+    }
+
+    _Py_atomic_store_int_relaxed(&pool->stopping, 1);
+    _Py_atomic_store_int_release(&pool->run_id, pool->run_id + 1);
+
+    for (int i = 0; i < pool->helper_count; i++) {
+        PyThread_join_thread(pool->helpers[i].handle);
+    }
+
+    PyMem_RawFree(pool->helpers);
+    pool->helpers = NULL;
+    gc_mark_queue_fini(&pool->queue);
+    PyCOND_FINI(&pool->finish_cond);
+    PyMUTEX_FINI(&pool->mutex);
+    pool->initialized = 0;
+}
+
+static int
+gc_parallel_mark_pool_run(gc_parallel_mark_pool *pool,
+                          PyInterpreterState *interp,
+                          struct collection_state *state,
+                          int helper_count)
+{
+    gc_parallel_mark_context ctx = { .shared = &pool->queue };
+    gc_mark_queue_reset(&pool->queue, helper_count + 1);
+
+#define PARALLEL_MARK_ROOT(op) \
+    do { \
+        if (gc_parallel_mark_enqueue_root((op), &pool->queue) < 0) { \
+            return -1; \
+        } \
+    } while (0)
+
+    PARALLEL_MARK_ROOT(interp->sysdict);
+#ifdef GC_MARK_ALIVE_EXTRA_ROOTS
+    PARALLEL_MARK_ROOT(interp->builtins);
+    PARALLEL_MARK_ROOT(interp->dict);
+    struct types_state *types = &interp->types;
+    for (int i = 0; i < _Py_MAX_MANAGED_STATIC_BUILTIN_TYPES; i++) {
+        PARALLEL_MARK_ROOT(types->builtins.initialized[i].tp_dict);
+        PARALLEL_MARK_ROOT(types->builtins.initialized[i].tp_subclasses);
+    }
+    for (int i = 0; i < _Py_MAX_MANAGED_STATIC_EXT_TYPES; i++) {
+        PARALLEL_MARK_ROOT(types->for_extensions.initialized[i].tp_dict);
+        PARALLEL_MARK_ROOT(types->for_extensions.initialized[i].tp_subclasses);
+    }
+#endif
+#ifdef GC_MARK_ALIVE_STACKS
+    if (gc_parallel_mark_thread_stacks(interp, &pool->queue) < 0) {
+        return -1;
+    }
+#endif
+#undef PARALLEL_MARK_ROOT
+
+    _Py_atomic_store_int_relaxed(&pool->finished, 0);
+    _Py_atomic_store_int_release(&pool->run_id, pool->run_id + 1);
+
+    int err = gc_parallel_mark_drain(&ctx);
+
+    PyMUTEX_LOCK(&pool->mutex);
+    while (_Py_atomic_load_int_acquire(&pool->finished) <
+           pool->helper_count) {
+        PyCOND_WAIT(&pool->finish_cond, &pool->mutex);
+    }
+    if (pool->queue.error) {
+        err = -1;
+    }
+    PyMUTEX_UNLOCK(&pool->mutex);
+
+    if (err != 0) {
+        gc_visit_heaps(interp, &gc_clear_alive_bits, &state->base);
+        return -1;
+    }
+    return 0;
+}
+
+static int
+gc_mark_alive_parallel(PyInterpreterState *interp,
+                       struct collection_state *state, int generation)
+{
+    int helper_count = gc_parallel_mark_desired_helpers(interp, generation);
+    if (helper_count <= 0) {
+        return 1;
+    }
+
+    gc_parallel_mark_pool *pool =
+        (gc_parallel_mark_pool *)interp->gc.parallel_mark_pool;
+    if (pool == NULL || pool->helper_count != helper_count) {
+        gc_parallel_mark_pool *new_pool =
+            PyMem_RawCalloc(1, sizeof(gc_parallel_mark_pool));
+        if (new_pool == NULL) {
+            return -1;
+        }
+        if (gc_parallel_mark_pool_init(new_pool, interp, helper_count) < 0) {
+            PyMem_RawFree(new_pool);
+            return -1;
+        }
+        if (pool != NULL) {
+            gc_parallel_mark_pool_fini(pool);
+            PyMem_RawFree(pool);
+        }
+        interp->gc.parallel_mark_pool = new_pool;
+        pool = new_pool;
+    }
+
+    return gc_parallel_mark_pool_run(pool, interp, state, helper_count);
+}
+
 
 // Using tp_traverse, mark everything reachable from known root objects
 // (which must be non-garbage) as alive (_PyGC_BITS_ALIVE is set).  In
@@ -1383,12 +1995,19 @@ gc_propagate_alive(gc_mark_args_t *args)
 // Returns -1 on failure (out of memory).
 static int
 gc_mark_alive_from_roots(PyInterpreterState *interp,
-                         struct collection_state *state)
+                         struct collection_state *state,
+                         int generation)
 {
 #ifdef GC_DEBUG
     // Check that all objects don't have alive bit set
     gc_visit_heaps(interp, &validate_alive_bits, &state->base);
 #endif
+
+    int parallel = gc_mark_alive_parallel(interp, state, generation);
+    if (parallel <= 0) {
+        return parallel;
+    }
+
     gc_mark_args_t mark_args = { 0 };
 
     // Using prefetch instructions is only a win if the set of objects being
@@ -1398,7 +2017,6 @@ gc_mark_alive_from_roots(PyInterpreterState *interp,
     // On 64-bit platforms, the minimum object size is 32 bytes.  A 4MB L2 cache
     // would hold about 130k objects.
     mark_args.use_prefetch = interp->gc.long_lived_total > 200000;
-
     #define MARK_ENQUEUE(op) \
         if (op != NULL ) { \
             if (gc_mark_enqueue(op, &mark_args) < 0) { \
@@ -2129,7 +2747,7 @@ gc_collect_internal(PyInterpreterState *interp, struct collection_state *state, 
     if (!state->gcstate->freeze_active) {
         // Mark objects reachable from known roots as "alive".  These will
         // be ignored for rest of the GC pass.
-        int err = gc_mark_alive_from_roots(interp, state);
+        int err = gc_mark_alive_from_roots(interp, state, generation);
         if (err < 0) {
             _PyEval_StartTheWorld(interp);
             cleanup_worklist(&state->objs_to_decref);
@@ -2682,6 +3300,17 @@ void
 _PyGC_Fini(PyInterpreterState *interp)
 {
     GCState *gcstate = &interp->gc;
+
+#ifdef Py_GIL_DISABLED
+    gc_parallel_mark_pool *pool =
+        (gc_parallel_mark_pool *)gcstate->parallel_mark_pool;
+    if (pool != NULL) {
+        gc_parallel_mark_pool_fini(pool);
+        PyMem_RawFree(pool);
+        gcstate->parallel_mark_pool = NULL;
+    }
+#endif
+
     Py_CLEAR(gcstate->garbage);
     Py_CLEAR(gcstate->callbacks);
     PyMem_RawFree(gcstate->generation_stats);

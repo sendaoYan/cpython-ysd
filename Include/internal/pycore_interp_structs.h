@@ -270,6 +270,10 @@ struct _gc_runtime_state {
 #ifdef Py_GIL_DISABLED
     /* True if gc.freeze() has been used. */
     int freeze_active;
+    /* Opaque per-interpreter state for the experimental parallel GC
+       mark worker pool.  The concrete struct lives in gc_free_threading.c
+       because it depends on private marking details. */
+    void *parallel_mark_pool;
 #else
     PyGC_Head *generation0;
 #endif
